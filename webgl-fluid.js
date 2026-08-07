@@ -80,6 +80,7 @@ function runSimulation(config) {
   let maskImageWidth = 0;  // original image pixel width  (0 = no image uploaded)
   let maskImageHeight = 0; // original image pixel height
   let maskTexture = null;  // WebGL texture of the uploaded image (null = none)
+  let overlayTexture = null; // top-layer PNG texture (default overlay.png, replaceable)
 
   // ---- GIF recording state ----
   let isRecording = false;
@@ -540,8 +541,10 @@ function runSimulation(config) {
         float inRect = m.x * m.y;
         // Map vUv from the mask rectangle into 0..1 for the image texture.
         vec2 imgUv = (vUv - uMaskRect.xy) / uMaskRect.zw;
+        // The texture is uploaded with UNPACK_PREMULTIPLY_ALPHA_WEBGL, so c.rgb
+        // is already premultiplied by c.a. We just gate it by the rect mask.
         vec4 c = texture2D(uImage, imgUv);
-        gl_FragColor = vec4(c.rgb * inRect, inRect);
+        gl_FragColor = vec4(c.rgb * inRect, c.a * inRect);
     }
 `
   );
@@ -1354,6 +1357,10 @@ function runSimulation(config) {
   initFramebuffers();
   multipleSplats(parseInt(Math.random() * 20) + 5);
 
+  // Load the default top-layer overlay PNG (overlay.png). Loaded async; if the
+  // file is missing it silently stays null and the layer is skipped.
+  loadOverlayImage("overlay.png");
+
   let lastUpdateTime = Date.now();
   let colorUpdateTimer = 0.0;
   let autoSplatsTimer = 0.0;
@@ -1417,6 +1424,8 @@ function runSimulation(config) {
 
     if (config.AUTO_SPLATS_MODE === "edge") {
       edgeFlowSplats();
+    } else if (config.AUTO_SPLATS_MODE === "safe") {
+      safeFlowSplats();
     } else {
       randomSplats();
     }
@@ -1431,6 +1440,35 @@ function runSimulation(config) {
       // only accumulates where it can actually be seen.
       const x = maskRect.x + Math.random() * maskRect.w;
       const y = maskRect.y + Math.random() * maskRect.h;
+      const dx = force * (Math.random() - 0.5);
+      const dy = force * (Math.random() - 0.5);
+      splat(x, y, dx, dy, color);
+    }
+  }
+
+  // Safe-zone mode: fluid only appears in two horizontal bands — a top band
+  // and a bottom band of the image — leaving the middle blank.
+  // SAFE_FLOW_TOP / SAFE_FLOW_BOTTOM are fractions (0..1) of the image height.
+  function safeFlowSplats() {
+    const force = config.AUTO_SPLATS_FORCE;
+    const topFrac = config.SAFE_FLOW_TOP == null ? 0.15 : config.SAFE_FLOW_TOP;
+    const botFrac = config.SAFE_FLOW_BOTTOM == null ? 0.30 : config.SAFE_FLOW_BOTTOM;
+    // Top band: from the rectangle's top edge downward.
+    // Bottom band: from the rectangle's bottom edge upward.
+    // Note: UV space y points up, so maskRect.y is the bottom.
+    const topY0 = maskRect.y + maskRect.h * (1 - topFrac);
+    const topH = maskRect.h * topFrac;
+    const botY0 = maskRect.y;
+    const botH = maskRect.h * botFrac;
+    for (let i = 0; i < config.AUTO_SPLATS_COUNT; i++) {
+      const color = generateColor();
+      // Pick the top or bottom band (weighted by their heights so both fill
+      // proportionally).
+      const useTop = Math.random() < topFrac / (topFrac + botFrac);
+      const x = maskRect.x + Math.random() * maskRect.w;
+      const y = useTop
+        ? topY0 + Math.random() * topH
+        : botY0 + Math.random() * botH;
       const dx = force * (Math.random() - 0.5);
       const dy = force * (Math.random() - 0.5);
       splat(x, y, dx, dy, color);
@@ -1752,6 +1790,8 @@ function runSimulation(config) {
     if (target == null && config.TRANSPARENT) drawCheckerboard(target);
     if (config.MASK_ENABLED && maskTexture) drawImage(target);
     drawDisplay(target);
+    // Top overlay only appears after the user uploads a layer-1 image.
+    if (maskTexture) drawOverlay(target);
   }
 
   function drawColor(target, color) {
@@ -1776,6 +1816,50 @@ function runSimulation(config) {
       maskRect.h
     );
     blit(target);
+  }
+
+  // Draw the top-layer overlay PNG (with transparency) on top of everything.
+  // Reuses imageShader so it is clipped to maskRect and respects alpha.
+  function drawOverlay(target) {
+    if (!overlayTexture) return;
+    imageProgram.bind();
+    gl.uniform1i(imageProgram.uniforms.uImage, 0);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, overlayTexture);
+    gl.uniform4f(
+      imageProgram.uniforms.uMaskRect,
+      maskRect.x,
+      maskRect.y,
+      maskRect.w,
+      maskRect.h
+    );
+    blit(target);
+  }
+
+  // Load an image file (by URL) into a WebGL texture for the overlay layer.
+  // Used both for the default overlay.png and for user-replaced images.
+  function loadOverlayImage(url) {
+    let img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => {
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+      let tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+      overlayTexture = tex;
+    };
+    img.onerror = () => {
+      // Silently ignore — overlay is optional.
+      console.warn("overlay image not found or failed to load:", url);
+    };
+    img.src = url;
   }
 
   function drawCheckerboard(target) {
@@ -2078,6 +2162,37 @@ function runSimulation(config) {
           updateMaskRect();
           // Kick the fluid so the new region fills in immediately.
           splatStack.push(parseInt(Math.random() * 20) + 5);
+        };
+        img.src = ev.target.result;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  // Top-layer overlay replacement button (#overlayFileInput added in index.html).
+  const overlayInput = document.getElementById("overlayFileInput");
+  if (overlayInput) {
+    overlayInput.addEventListener("change", (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        const img = new Image();
+        img.onload = () => {
+          gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+          gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+          // Replace the previous overlay texture if any.
+          if (overlayTexture) gl.deleteTexture(overlayTexture);
+          let tex = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_2D, tex);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+          gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+          gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+          overlayTexture = tex;
         };
         img.src = ev.target.result;
       };

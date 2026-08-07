@@ -40,7 +40,7 @@
 
     <!--SETUP: update the file paths if you move the file-->
     <!-- Cache-busting: bump ASSET_VER when you deploy to force fresh assets -->
-    <link rel="stylesheet" href="fluid-overlay-styles.css?v=2" />
+    <link rel="stylesheet" href="fluid-overlay-styles.css?v=3" />
 
     <!--REMOVE THE FOLLOWING LINE-->
     <meta name="google-site-verification" content="KxV1WEjEkGzvRm3viGVmb1_nOUMs4bxHwcnRzFqIgxQ" />
@@ -56,13 +56,15 @@
       View the README
     </a>
 
-    <!-- Hidden file input for the image mask uploader -->
+    <!-- Hidden file inputs -->
     <input type="file" id="maskFileInput" accept="image/*" style="display:none" />
+    <input type="file" id="overlayFileInput" accept="image/*" style="display:none" />
 
     <!-- Mask uploader controls -->
     <div class="mask-controls">
       <button type="button" id="maskUploadBtn">选择图片</button>
       <button type="button" id="maskResetBtn">重置</button>
+      <button type="button" id="overlayUploadBtn">替换顶层</button>
       <button type="button" id="gifExportBtn">导出 GIF</button>
       <button type="button" id="controlsToggleBtn" title="流体设置">⚙️</button>
     </div>
@@ -79,12 +81,23 @@
           <select id="ctrlFlowMode">
             <option value="random">随机</option>
             <option value="edge">顺时针边缘</option>
+            <option value="safe">安全区内随机</option>
           </select>
         </label>
         <label class="ctrl-row">
           <span class="ctrl-label">旋转速度</span>
           <input type="range" id="ctrlEdgeSpeed" min="0.02" max="0.2" step="0.01" />
           <span class="ctrl-value" id="valEdgeSpeed"></span>
+        </label>
+        <label class="ctrl-row">
+          <span class="ctrl-label">顶部占比</span>
+          <input type="range" id="ctrlSafeTop" min="0" max="0.5" step="0.01" />
+          <span class="ctrl-value" id="valSafeTop"></span>
+        </label>
+        <label class="ctrl-row">
+          <span class="ctrl-label">底部占比</span>
+          <input type="range" id="ctrlSafeBottom" min="0" max="0.5" step="0.01" />
+          <span class="ctrl-value" id="valSafeBottom"></span>
         </label>
         <label class="ctrl-row">
           <span class="ctrl-label">流动区域</span>
@@ -139,7 +152,7 @@
     <!--END OF CONTENT-->
 
     <!--SETUP: update the file paths if you move the file. Moving config and the LDR image requires making changes in the script-->
-    <script src="./webgl-fluid.js?v=2"></script>
+    <script src="./webgl-fluid.js?v=3"></script>
     <script>
       // Wire up the mask uploader buttons (webgl-fluid.js listens on the input).
       const _maskInput = document.getElementById("maskFileInput");
@@ -155,6 +168,13 @@
           // Dispatch a change with no file so the handler resets the mask.
           _maskInput.dispatchEvent(new Event("change"));
         });
+      }
+
+      // Top-layer overlay replacement button.
+      const _overlayInput = document.getElementById("overlayFileInput");
+      const _overlayBtn = document.getElementById("overlayUploadBtn");
+      if (_overlayBtn && _overlayInput) {
+        _overlayBtn.addEventListener("click", () => _overlayInput.click());
       }
 
       // GIF export button — calls the recording function exposed by webgl-fluid.js.
@@ -188,7 +208,7 @@
           // ---- Persistence: restore saved values, auto-save on every change ----
           const STORE_KEY = "fluidSettings_v1";
           const PERSIST_KEYS = [
-            "AUTO_SPLATS_MODE", "EDGE_FLOW_SPEED", "MASK_SCALE",
+            "AUTO_SPLATS_MODE", "EDGE_FLOW_SPEED", "SAFE_FLOW_TOP", "SAFE_FLOW_BOTTOM", "MASK_SCALE",
             "SPLAT_RADIUS", "AUTO_SPLATS_INTERVAL", "AUTO_SPLATS_FORCE",
             "AUTO_SPLATS_COUNT", "DENSITY_DISSIPATION", "CURL",
             "SPLAT_HUE", "BACK_COLOR",
@@ -236,6 +256,8 @@
             });
           }
           bindRange("ctrlEdgeSpeed", "valEdgeSpeed", "EDGE_FLOW_SPEED");
+          bindRange("ctrlSafeTop", "valSafeTop", "SAFE_FLOW_TOP");
+          bindRange("ctrlSafeBottom", "valSafeBottom", "SAFE_FLOW_BOTTOM");
 
           bindRange("ctrlSplatRadius", "valSplatRadius", "SPLAT_RADIUS");
           bindRange("ctrlAutoInterval", "valAutoInterval", "AUTO_SPLATS_INTERVAL");
