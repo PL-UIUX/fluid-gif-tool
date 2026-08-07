@@ -59,8 +59,8 @@ canvas {
   font-weight: bold;
   z-index: 1;
   position: fixed;
-  bottom: 20px;          
-  left: 20px;            
+  top: 20px;
+  left: 20px;
   border-radius: 50px;
   cursor: pointer;
   overflow: hidden;
@@ -82,10 +82,10 @@ canvas {
   }
 }
 
-/* Mask uploader controls (bottom-right) */
+/* Mask uploader controls (top-right) */
 .mask-controls {
   position: fixed;
-  bottom: 20px;
+  top: 20px;
   right: 20px;
   display: flex;
   gap: 10px;
@@ -116,7 +116,7 @@ canvas {
 /* ---- Fluid controls panel ---- */
 .controls-panel {
   position: fixed;
-  bottom: 70px; /* sits above the button row */
+  top: 70px; /* sits below the button row */
   right: 20px;
   width: 280px;
   max-height: 70vh;
@@ -136,7 +136,7 @@ canvas {
 
 .controls-panel.hidden {
   opacity: 0;
-  transform: translateY(10px) scale(0.98);
+  transform: translateY(-10px) scale(0.98);
   pointer-events: none;
 }
 
