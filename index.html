@@ -39,7 +39,8 @@
     <link rel="icon" href="" type="image/png" />
 
     <!--SETUP: update the file paths if you move the file-->
-    <link rel="stylesheet" href="fluid-overlay-styles.css" />
+    <!-- Cache-busting: bump ASSET_VER when you deploy to force fresh assets -->
+    <link rel="stylesheet" href="fluid-overlay-styles.css?v=2" />
 
     <!--REMOVE THE FOLLOWING LINE-->
     <meta name="google-site-verification" content="KxV1WEjEkGzvRm3viGVmb1_nOUMs4bxHwcnRzFqIgxQ" />
@@ -138,7 +139,7 @@
     <!--END OF CONTENT-->
 
     <!--SETUP: update the file paths if you move the file. Moving config and the LDR image requires making changes in the script-->
-    <script src="./webgl-fluid.js"></script>
+    <script src="./webgl-fluid.js?v=2"></script>
     <script>
       // Wire up the mask uploader buttons (webgl-fluid.js listens on the input).
       const _maskInput = document.getElementById("maskFileInput");
