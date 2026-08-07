@@ -47,7 +47,7 @@ const canvas = document.getElementsByTagName("canvas")[0];
 resizeCanvas();
 
 // Set the properties from the config file
-fetch("config.json")
+fetch("config.json?v=" + Date.now())
   .then((response) => response.json())
   .then((config) => {
     runSimulation(config);
@@ -74,6 +74,21 @@ function runSimulation(config) {
   let pointers = [];
   let splatStack = [];
   pointers.push(new pointerPrototype());
+
+  // Mask rectangle (x, y, w, h) in UV space, restricting where fluid is visible.
+  let maskRect = { x: 0, y: 0, w: 1, h: 1 };
+  let maskImageWidth = 0;  // original image pixel width  (0 = no image uploaded)
+  let maskImageHeight = 0; // original image pixel height
+  let maskTexture = null;  // WebGL texture of the uploaded image (null = none)
+
+  // ---- GIF recording state ----
+  let isRecording = false;
+  let recordFBO = null;          // offscreen framebuffer reused for every frame
+  let gifWorker = null;
+  let recordFrameCount = 0;
+  let recordTargetFrames = 0;
+  let recordInterval = 0;        // seconds between captured frames
+  let recordAccumulator = 0;     // time accumulator for frame pacing
 
   const { gl, ext } = getWebGLContext(canvas);
 
@@ -239,6 +254,30 @@ function runSimulation(config) {
       texture
     );
     return texture;
+  }
+
+  // Like framebufferToTexture but only reads a sub-rectangle (rx, ry, rw, rh,
+  // pixel units, origin bottom-left) and returns Uint8 0..255 with Y already
+  // flipped to top-left. Used to crop the GIF capture to the image region.
+  function framebufferToTextureRect(target, rx, ry, rw, rh) {
+    gl.bindFramebuffer(gl.FRAMEBUFFER, target.fbo);
+    let length = rw * rh * 4;
+    let texture = new Float32Array(length);
+    gl.readPixels(rx, ry, rw, rh, gl.RGBA, gl.FLOAT, texture);
+    // Clamp to 0..255 and flip Y (readPixels is bottom-up).
+    let result = new Uint8Array(length);
+    let id = 0;
+    for (let i = rh - 1; i >= 0; i--) {
+      for (let j = 0; j < rw; j++) {
+        let nid = i * rw * 4 + j * 4;
+        result[nid + 0] = clamp01(texture[id + 0]) * 255;
+        result[nid + 1] = clamp01(texture[id + 1]) * 255;
+        result[nid + 2] = clamp01(texture[id + 2]) * 255;
+        result[nid + 3] = clamp01(texture[id + 3]) * 255;
+        id += 4;
+      }
+    }
+    return result;
   }
 
   function normalizeTexture(texture, width, height) {
@@ -483,6 +522,30 @@ function runSimulation(config) {
 `
   );
 
+  // Draws the uploaded image inside the mask rectangle (uMaskRect = x,y,w,h).
+  // Outside the rectangle it outputs transparent black so the black background
+  // shows through. Uses nearest on the rect bounds for a sharp edge.
+  const imageShader = compileShader(
+    gl.FRAGMENT_SHADER,
+    `
+    precision highp float;
+    precision highp sampler2D;
+
+    varying vec2 vUv;
+    uniform sampler2D uImage;
+    uniform vec4 uMaskRect;
+
+    void main () {
+        vec2 m = step(uMaskRect.xy, vUv) * step(vUv, uMaskRect.xy + uMaskRect.zw);
+        float inRect = m.x * m.y;
+        // Map vUv from the mask rectangle into 0..1 for the image texture.
+        vec2 imgUv = (vUv - uMaskRect.xy) / uMaskRect.zw;
+        vec4 c = texture2D(uImage, imgUv);
+        gl_FragColor = vec4(c.rgb * inRect, inRect);
+    }
+`
+  );
+
   const checkerboardShader = compileShader(
     gl.FRAGMENT_SHADER,
     `
@@ -519,6 +582,7 @@ function runSimulation(config) {
     uniform sampler2D uDithering;
     uniform vec2 ditherScale;
     uniform vec2 texelSize;
+    uniform vec4 uMaskRect;
 
     vec3 linearToGamma (vec3 color) {
         color = max(color, vec3(0));
@@ -563,6 +627,12 @@ function runSimulation(config) {
         bloom = linearToGamma(bloom);
         c += bloom;
     #endif
+
+        // Restrict fluid visibility to the uploaded image rectangle.
+        // uMaskRect = (x, y, w, h) in UV space; outside → c=0, a=0.
+        vec2 _m = step(uMaskRect.xy, vUv) * step(vUv, uMaskRect.xy + uMaskRect.zw);
+        float inRect = _m.x * _m.y;
+        c *= inRect;
 
         float a = max(c.r, max(c.g, c.b));
         gl_FragColor = vec4(c, a);
@@ -960,6 +1030,7 @@ function runSimulation(config) {
   const copyProgram = new Program(baseVertexShader, copyShader);
   const clearProgram = new Program(baseVertexShader, clearShader);
   const colorProgram = new Program(baseVertexShader, colorShader);
+  const imageProgram = new Program(baseVertexShader, imageShader);
   const checkerboardProgram = new Program(baseVertexShader, checkerboardShader);
   const bloomPrefilterProgram = new Program(
     baseVertexShader,
@@ -1285,15 +1356,22 @@ function runSimulation(config) {
 
   let lastUpdateTime = Date.now();
   let colorUpdateTimer = 0.0;
+  let autoSplatsTimer = 0.0;
+  let edgeFlowT = 0.0; // progress 0..1 along the mask rect perimeter (edge mode)
   update();
 
   function update() {
     const dt = calcDeltaTime();
-    if (resizeCanvas()) initFramebuffers();
+    if (resizeCanvas()) {
+      initFramebuffers();
+      updateMaskRect();
+    }
     updateColors(dt);
     applyInputs();
+    autoSplats(dt);
     if (!config.PAUSED) step(dt);
     render(null);
+    if (isRecording) captureFrameForGif(dt);
     requestAnimationFrame(update);
   }
 
@@ -1326,6 +1404,224 @@ function runSimulation(config) {
         splatPointer(p);
       }
     });
+  }
+
+  // Automatic continuous splats — drives the fluid by itself,
+  // no mouse/touch needed. All settings come from config.json.
+  function autoSplats(dt) {
+    if (!config.AUTO_SPLATS) return;
+
+    autoSplatsTimer += dt;
+    if (autoSplatsTimer < config.AUTO_SPLATS_INTERVAL) return;
+    autoSplatsTimer = 0.0;
+
+    if (config.AUTO_SPLATS_MODE === "edge") {
+      edgeFlowSplats();
+    } else {
+      randomSplats();
+    }
+  }
+
+  // Default mode: random splats scattered inside the mask rectangle.
+  function randomSplats() {
+    const force = config.AUTO_SPLATS_FORCE;
+    for (let i = 0; i < config.AUTO_SPLATS_COUNT; i++) {
+      const color = generateColor();
+      // Keep the new splats inside the visible mask rectangle so fluid
+      // only accumulates where it can actually be seen.
+      const x = maskRect.x + Math.random() * maskRect.w;
+      const y = maskRect.y + Math.random() * maskRect.h;
+      const dx = force * (Math.random() - 0.5);
+      const dy = force * (Math.random() - 0.5);
+      splat(x, y, dx, dy, color);
+    }
+  }
+
+  // Edge mode: splats travel clockwise around the mask rectangle perimeter,
+  // each pushed along the local tangent so the fluid forms a circulating band.
+  function edgeFlowSplats() {
+    const force = config.AUTO_SPLATS_FORCE;
+    const count = config.AUTO_SPLATS_COUNT;
+    // Advance the head of the train along the perimeter. EDGE_FLOW_SPEED is
+    // the per-splat step in perimeter fraction; loop time ≈ INTERVAL/step.
+    const step = config.EDGE_FLOW_SPEED == null ? 0.06 : config.EDGE_FLOW_SPEED;
+    edgeFlowT = (edgeFlowT + step) % 1.0;
+    for (let i = 0; i < count; i++) {
+      // Spread the count splats evenly behind the head so they read as a
+      // continuous streak hugging the edge.
+      let t = (edgeFlowT - (i / count) * 0.08 + 1.0) % 1.0;
+      const p = pointOnRectEdge(t, maskRect);
+      const color = generateColor();
+      splat(p.x, p.y, p.tx * force, p.ty * force, color);
+    }
+  }
+
+  // Map a perimeter parameter t (0..1) to a point on the rectangle's edge in
+  // UV space, returning the position and the clockwise tangent direction.
+  // Screen-clockwise (viewer perspective): top→right, right→bottom,
+  // bottom→left, left→top. In UV space (y up) that is: top edge +x, right
+  // edge -y, bottom edge -x, left edge +y.
+  function pointOnRectEdge(t, r) {
+    const { x, y, w, h } = r;
+    const perim = 2 * (w + h);
+    let d = (t % 1) * perim;
+    let px, py, tx, ty;
+    if (d < w) {
+      // top edge: left → right, tangent +x
+      px = x + d; py = y + h; tx = 1; ty = 0;
+    } else if ((d -= w) < h) {
+      // right edge: top → bottom, tangent -y
+      px = x + w; py = y + h - d; tx = 0; ty = -1;
+    } else if ((d -= h) < w) {
+      // bottom edge: right → left, tangent -x
+      px = x + w - d; py = y; tx = -1; ty = 0;
+    } else {
+      // left edge: bottom → top, tangent +y
+      d -= w; px = x; py = y + d; tx = 0; ty = 1;
+    }
+    return { x: px, y: py, tx, ty };
+  }
+
+  // ---- GIF recording ----
+
+  // Build (or rebuild) the offscreen FBO used to capture frames.
+  function getRecordFBO() {
+    let res = getResolution(config.GIF_RESOLUTION || 384);
+    if (
+      !recordFBO ||
+      recordFBO.width !== res.width ||
+      recordFBO.height !== res.height
+    ) {
+      recordFBO = createFBO(
+        res.width,
+        res.height,
+        ext.formatRGBA.internalFormat,
+        ext.formatRGBA.format,
+        ext.halfFloatTexType,
+        gl.NEAREST
+      );
+    }
+    return recordFBO;
+  }
+
+  // Called from update() every frame while recording. Paces capture to the
+  // configured GIF fps so we don't grab more frames than needed.
+  function captureFrameForGif(dt) {
+    recordAccumulator += dt;
+    if (recordAccumulator < recordInterval) return;
+    recordAccumulator = 0.0;
+
+    // Render the current simulation state into an offscreen FBO, then read it
+    // back. This mirrors captureScreenshot() and avoids the
+    // preserveDrawingBuffer:false gotcha.
+    const target = getRecordFBO();
+    render(target);
+
+    // When an image is uploaded, crop the capture to its rectangle so the GIF
+    // has no black borders. Otherwise capture the whole frame.
+    const hasRect = maskTexture && config.MASK_ENABLED;
+    const rw = hasRect
+      ? Math.round(maskRect.w * target.width)
+      : target.width;
+    const rh = hasRect
+      ? Math.round(maskRect.h * target.height)
+      : target.height;
+    // readPixels origin is bottom-left; maskRect is already bottom-left UV.
+    const rx = hasRect ? Math.round(maskRect.x * target.width) : 0;
+    const ry = hasRect ? Math.round(maskRect.y * target.height) : 0;
+
+    let texture = framebufferToTextureRect(target, rx, ry, rw, rh);
+
+    gifWorker.postMessage(
+      { type: "frame", data: texture, width: rw, height: rh },
+      [texture.buffer]
+    );
+
+    recordFrameCount++;
+    if (recordFrameCount >= recordTargetFrames) finishRecording();
+  }
+
+  function startRecording() {
+    if (isRecording) return;
+    if (typeof Worker === "undefined") {
+      alert("Your browser does not support Web Workers; cannot export GIF.");
+      return;
+    }
+    const target = getRecordFBO();
+
+    // Reset pacing/counters.
+    const fps = config.GIF_FPS || 15;
+    const duration = config.GIF_DURATION || 3;
+    recordInterval = 1 / fps;
+    recordAccumulator = 0.0;
+    recordFrameCount = 0;
+    recordTargetFrames = Math.max(1, Math.round(fps * duration));
+
+    // Spin up the worker.
+    gifWorker = new Worker("gif-worker.js");
+    gifWorker.onmessage = (e) => {
+      if (e.data.type === "done") {
+        const blob = new Blob([new Uint8Array(e.data.data)], {
+          type: "image/gif",
+        });
+        const url = URL.createObjectURL(blob);
+        downloadURI("fluid.gif", url);
+        URL.revokeObjectURL(url);
+        const btn = document.getElementById("gifExportBtn");
+        if (btn) {
+          btn.textContent = "导出 GIF";
+          btn.disabled = false;
+        }
+      }
+    };
+    gifWorker.onerror = (err) => {
+      console.error("gif worker error", err);
+      isRecording = false;
+      const btn = document.getElementById("gifExportBtn");
+      if (btn) {
+        btn.textContent = "导出 GIF";
+        btn.disabled = false;
+      }
+      alert("GIF 编码失败,请查看控制台。");
+    };
+
+    // The GIF frame size matches the image rectangle (cropped), or the whole
+    // frame if no image is uploaded.
+    const hasRect = maskTexture && config.MASK_ENABLED;
+    const gifW = hasRect
+      ? Math.round(maskRect.w * target.width)
+      : target.width;
+    const gifH = hasRect
+      ? Math.round(maskRect.h * target.height)
+      : target.height;
+
+    gifWorker.postMessage({
+      type: "start",
+      width: gifW,
+      height: gifH,
+      fps: fps,
+    });
+
+    isRecording = true;
+    const btn = document.getElementById("gifExportBtn");
+    if (btn) {
+      btn.textContent = "抓取画面…";
+      btn.disabled = true;
+    }
+  }
+  // Expose to the page so the HTML button can trigger recording.
+  window.startFluidGif = startRecording;
+  // Expose the live config so the controls panel can tweak values at runtime.
+  window.fluidConfig = config;
+  // Expose maskRect refresh so the "flow region" slider can resize it live.
+  window.refreshFluidMask = updateMaskRect;
+
+  function finishRecording() {
+    if (!isRecording) return;
+    isRecording = false;
+    const btn = document.getElementById("gifExportBtn");
+    if (btn) btn.textContent = "编码中…";
+    gifWorker.postMessage({ type: "finish" });
   }
 
   function step(dt) {
@@ -1454,12 +1750,31 @@ function runSimulation(config) {
     if (!config.TRANSPARENT)
       drawColor(target, normalizeColor(config.BACK_COLOR));
     if (target == null && config.TRANSPARENT) drawCheckerboard(target);
+    if (config.MASK_ENABLED && maskTexture) drawImage(target);
     drawDisplay(target);
   }
 
   function drawColor(target, color) {
     colorProgram.bind();
     gl.uniform4f(colorProgram.uniforms.color, color.r, color.g, color.b, 1);
+    blit(target);
+  }
+
+  // Draw the uploaded image into the mask rectangle, on top of the background
+  // and beneath the fluid. Blend mode is already (ONE, ONE_MINUS_SRC_ALPHA)
+  // from render(), so the image alpha is respected.
+  function drawImage(target) {
+    imageProgram.bind();
+    gl.uniform1i(imageProgram.uniforms.uImage, 0);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, maskTexture);
+    gl.uniform4f(
+      imageProgram.uniforms.uMaskRect,
+      maskRect.x,
+      maskRect.y,
+      maskRect.w,
+      maskRect.h
+    );
     blit(target);
   }
 
@@ -1495,6 +1810,14 @@ function runSimulation(config) {
     }
     if (config.SUNRAYS)
       gl.uniform1i(displayMaterial.uniforms.uSunrays, sunrays.attach(3));
+    // Pass the image mask rectangle (x, y, w, h) in UV space.
+    gl.uniform4f(
+      displayMaterial.uniforms.uMaskRect,
+      maskRect.x,
+      maskRect.y,
+      maskRect.w,
+      maskRect.h
+    );
     blit(target);
   }
 
@@ -1692,6 +2015,75 @@ function runSimulation(config) {
     if (e.code === "KeyP") config.PAUSED = !config.PAUSED;
     if (e.key === " ") splatStack.push(parseInt(Math.random() * 20) + 5);
   });
+
+  // ---- Image mask: restrict fluid to the uploaded image rectangle ----
+
+  // Recompute maskRect so the image is fit (contain) and centred in the canvas.
+  // Coordinates are in display-shader UV space, where vUv=(0,0) is the
+  // bottom-left and (1,1) is the top-right.
+  function updateMaskRect() {
+    if (maskImageWidth === 0 || maskImageHeight === 0 || !config.MASK_ENABLED) {
+      maskRect = { x: 0, y: 0, w: 1, h: 1 };
+      return;
+    }
+    const cw = canvas.width;
+    const ch = canvas.height;
+    const scale = Math.min(cw / maskImageWidth, ch / maskImageHeight);
+    // MASK_SCALE lets the user grow/shrink the active region relative to the
+    // uploaded image size (1.0 = exact image size).
+    const maskScale = config.MASK_SCALE == null ? 1.0 : config.MASK_SCALE;
+    const drawW = maskImageWidth * scale * maskScale;
+    const drawH = maskImageHeight * scale * maskScale;
+    // Normalise to 0..1 in the same orientation as vUv (bottom-left origin).
+    const w = drawW / cw;
+    const h = drawH / ch;
+    const x = (cw - drawW) / 2 / cw;
+    const y = (ch - drawH) / 2 / ch;
+    maskRect = { x, y, w, h };
+  }
+
+  // Hook the file input (added in index.html) to load an uploaded image.
+  const maskInput = document.getElementById("maskFileInput");
+  if (maskInput) {
+    maskInput.addEventListener("change", (e) => {
+      const file = e.target.files && e.target.files[0];
+      // Reset branch (no file): clear the mask and image texture.
+      if (!file) {
+        maskImageWidth = 0;
+        maskImageHeight = 0;
+        maskTexture = null;
+        updateMaskRect();
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        const img = new Image();
+        img.onload = () => {
+          maskImageWidth = img.width;
+          maskImageHeight = img.height;
+          // Upload the image to a WebGL texture.
+          // Flip Y so the image appears upright in UV space (bottom-left origin).
+          gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+          let tex = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_2D, tex);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          gl.texImage2D(
+            gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img
+          );
+          gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+          maskTexture = tex;
+          updateMaskRect();
+          // Kick the fluid so the new region fills in immediately.
+          splatStack.push(parseInt(Math.random() * 20) + 5);
+        };
+        img.src = ev.target.result;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
 
   function updatePointerDownData(pointer, id, posX, posY) {
     pointer.id = id;
